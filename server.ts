@@ -6,8 +6,10 @@
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
+import fs from 'fs';
 import {GoogleGenAI} from '@google/genai';
 import dotenv from 'dotenv';
+import { createServer as createViteServer } from 'vite';
 import { readDB, writeDB, logActivity } from './server/db';
 import { evaluateOutfitRecommendation } from './src/utils/recommendationEngine';
 import { Gender, BodyType, ClothingType, Pattern, SavedOutfit, Occasion, DashboardAnalytics } from './src/types';
@@ -29,7 +31,14 @@ function getAIClient(): GoogleGenAI | null {
     const key = process.env.GEMINI_API_KEY;
     if (key && key !== 'MY_GEMINI_API_KEY') {
       try {
-        aiClient = new GoogleGenAI({ apiKey: key });
+        aiClient = new GoogleGenAI({
+          apiKey: key,
+          httpOptions: {
+            headers: {
+              'User-Agent': 'aistudio-build',
+            }
+          }
+        });
       } catch (err) {
         console.error('Failed to initialize GoogleGenAI client:', err);
       }
@@ -38,9 +47,92 @@ function getAIClient(): GoogleGenAI | null {
   return aiClient;
 }
 
+// Robust retry utility with exponential backoff and model auto-fallbacks
+async function callGeminiWithRetry(client: GoogleGenAI, params: any, maxRetries = 2): Promise<any> {
+  const primaryModel = params.model || 'gemini-3.5-flash';
+  const modelsToTry = [primaryModel, 'gemini-3.5-flash'];
+  const uniqueModels = Array.from(new Set(modelsToTry));
+
+  let lastError: any = null;
+
+  for (const model of uniqueModels) {
+    let delay = 1000;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        console.log(`Calling Gemini with model ${model} (attempt ${attempt + 1}/${maxRetries + 1})...`);
+        const response = await client.models.generateContent({
+          ...params,
+          model: model
+        });
+        return response;
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`Attempt ${attempt + 1} with model ${model} failed:`, err?.message || err);
+        
+        // If it's a 4xx/client-side error, don't retry same model
+        const errStr = String(err).toLowerCase();
+        if (errStr.includes('invalid') || errStr.includes('bad request') || errStr.includes('400')) {
+          break; 
+        }
+
+        if (attempt < maxRetries) {
+          console.log(`Waiting ${delay}ms before retrying...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          delay *= 2;
+        }
+      }
+    }
+  }
+  throw lastError || new Error('Gemini API call failed after multiple attempts and fallbacks.');
+}
+
 // Ensure database starts with seeded values
 const currentDB = readDB();
 console.log(`Database initialized with ${currentDB.users.length} users and ${currentDB.clothing.length} clothing items.`);
+
+const PRESET_MAPPING: Record<string, {
+  gender: Gender;
+  clothType: ClothingType;
+  color: string;
+  hexCode: string;
+  pattern: Pattern;
+}> = {
+  'photo-1521572267360-ee0c2909d518': {
+    gender: 'Unisex',
+    clothType: 'T-Shirt',
+    color: 'White',
+    hexCode: '#ffffff',
+    pattern: 'Plain'
+  },
+  'photo-1596755094514-f87e34085b2c': {
+    gender: 'Men',
+    clothType: 'Shirt',
+    color: 'Navy Blue',
+    hexCode: '#002060',
+    pattern: 'Plain'
+  },
+  'photo-1598033129183-c4f50c736f10': {
+    gender: 'Men',
+    clothType: 'Shirt',
+    color: 'Olive Green',
+    hexCode: '#556b2f',
+    pattern: 'Checked'
+  },
+  'photo-1556911220-e15b29be8c8f': {
+    gender: 'Unisex',
+    clothType: 'Hoodie',
+    color: 'Black',
+    hexCode: '#101010',
+    pattern: 'Plain'
+  },
+  'photo-1595777457583-95e059d581b8': {
+    gender: 'Women',
+    clothType: 'Dress',
+    color: 'Red',
+    hexCode: '#d32f2f',
+    pattern: 'Floral'
+  }
+};
 
 /**
  * 1. POST /api/analyze-clothing
@@ -57,6 +149,49 @@ app.post('/api/analyze-clothing', async (req, res) => {
   // Log activity
   logActivity('avsatish389@gmail.com', `Initiated clothing image analysis: ${filename || 'upload.jpg'}`);
 
+  // Check if image is a known preset URL to bypass remote requests & API calls entirely
+  let presetMatch = null;
+  for (const [key, presetVal] of Object.entries(PRESET_MAPPING)) {
+    if (image.includes(key)) {
+      presetMatch = presetVal;
+      break;
+    }
+  }
+
+  if (presetMatch) {
+    console.log('Detected preset wardrobe piece: Matching URL key for preset analysis.');
+    const result = {
+      gender: presetMatch.gender,
+      bodyType: 'Medium',
+      clothType: presetMatch.clothType,
+      color: presetMatch.color,
+      pattern: presetMatch.pattern,
+      hexCode: presetMatch.hexCode
+    };
+
+    const db = readDB();
+    const newClothing = {
+      id: `cloth_${Date.now()}`,
+      user_id: 'user_satish_1',
+      image_url: image,
+      clothing_type: result.clothType as ClothingType,
+      color: result.color,
+      hex_code: result.hexCode,
+      pattern: result.pattern as Pattern,
+      gender_category: result.gender as Gender,
+      created_at: new Date().toISOString()
+    };
+    db.clothing.push(newClothing);
+    writeDB(db);
+
+    logActivity('avsatish389@gmail.com', `Completed preset analysis: Found ${result.color} ${result.pattern} ${result.clothType}`);
+    return res.json({
+      ...result,
+      clothingId: newClothing.id,
+      imageUrl: newClothing.image_url
+    });
+  }
+
   // Base64 helper extraction
   let mimeType = 'image/jpeg';
   let base64Data = image;
@@ -66,10 +201,31 @@ app.post('/api/analyze-clothing', async (req, res) => {
       mimeType = matches[1];
       base64Data = matches[2];
     }
+  } else if (image.startsWith('http://') || image.startsWith('https://')) {
+    try {
+      console.log(`Fetching image from URL for analysis: ${image}`);
+      const fetchRes = await fetch(image);
+      if (fetchRes.ok) {
+        const arrayBuffer = await fetchRes.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        base64Data = buffer.toString('base64');
+        const contentType = fetchRes.headers.get('content-type');
+        if (contentType) {
+          mimeType = contentType;
+        }
+      } else {
+        console.warn(`Failed to fetch remote image from URL: ${fetchRes.statusText}`);
+      }
+    } catch (fetchErr) {
+      console.error('Error fetching image from URL:', fetchErr);
+    }
   }
 
+  // Safely check if we got actual base64 data to pass to Gemini
+  const isValidBase64 = !base64Data.startsWith('http://') && !base64Data.startsWith('https://') && base64Data.length > 50;
+
   const client = getAIClient();
-  if (client) {
+  if (client && isValidBase64) {
     try {
       console.log('Sending base64 image to Gemini API for analytical detection...');
       
@@ -84,8 +240,8 @@ app.post('/api/analyze-clothing', async (req, res) => {
 
 Ensure the output is parseable raw JSON. Do not include markdown formatting or backticks outside the json structure.`;
 
-      const response = await client.models.generateContent({
-        model: 'gemini-2.5-flash',
+      const response = await callGeminiWithRetry(client, {
+        model: 'gemini-3.5-flash',
         contents: [
           prompt,
           {
@@ -484,8 +640,8 @@ Keep the advice elegant, extremely clean, concise (maximum 3 concise bulleted su
 
 User question: ${latestMsg}`;
 
-      const response = await client.models.generateContent({
-        model: 'gemini-2.5-flash',
+      const response = await callGeminiWithRetry(client, {
+        model: 'gemini-3.5-flash',
         contents: prompt
       });
 
@@ -513,19 +669,36 @@ User question: ${latestMsg}`;
   return res.json({ text: reply });
 });
 
-// Serve static compiled assets in production
-app.use(express.static(path.join(process.cwd(), 'dist')));
+// Bootstrapping server with Vite integration & SPA routing
+async function startServer() {
+  const distPath = path.join(process.cwd(), 'dist');
+  const distExists = fs.existsSync(distPath);
 
-// SPA route fallback to index.html
-app.get('*', (req, res, next) => {
-  // Check if API endpoint - let next handle it or show 404
-  if (req.path.startsWith('/api')) {
-    return next();
+  if (process.env.NODE_ENV === 'production' && distExists) {
+    // Serve static compiled assets in production
+    app.use(express.static(distPath));
+
+    // SPA route fallback to index.html
+    app.get('*', (req, res, next) => {
+      // Check if API endpoint - let next handle it or show 404
+      if (req.path.startsWith('/api')) {
+        return next();
+      }
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  } else {
+    // Fallback to Vite dev server in development or when dist doesn't exist
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
   }
-  res.sendFile(path.join(process.cwd(), 'dist', 'index.html'));
-});
 
-// Start listening
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Fashion Finder full-stack server running live on port ${PORT}`);
-});
+  // Start listening
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Fashion Finder full-stack server running live on port ${PORT}`);
+  });
+}
+
+startServer();
